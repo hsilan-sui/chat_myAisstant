@@ -1,71 +1,155 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify, send_file
+import requests
 from flask_cors import CORS
 import os
-import uuid
+import subprocess
 from openai import OpenAI
-from datetime import datetime
+from gtts import gTTS
+from langdetect import detect
+import paho.mqtt.client as mqtt
 
 app = Flask(__name__)
-CORS(app)  # 启用 CORS
+CORS(app)
 
 client = OpenAI()
 
+# MQTT broker details
+mqtt_broker = "broker.mqttgo.io"
+mqtt_port = 1883
+mqtt_topic = "sui/audio/new"
+
+# 增加 MQTT 发布回调函数
+def on_publish(client, userdata, mid):
+    print("MQTT 消息已成功發佈，ID:", mid)
+
+mqtt_client = mqtt.Client()
+mqtt_client.on_publish = on_publish  # 设置发布回调函数
+mqtt_client.connect(mqtt_broker, mqtt_port, 60)
+
 # 指定上传目录
 UPLOAD_DIR = "uploads"
-
-# 确保上传目录存在
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
 
-@app.route('/')
-def index():
-    return "ESP32與ChatGPT語音開發"
+# 每次都覆蓋相同名稱的文件
+WAV_FILE = os.path.join(UPLOAD_DIR, "recording.wav")
+TTS_FILE = os.path.join(UPLOAD_DIR, "output.wav")  # 固定 TTS 文件名稱
 
-# 接收逐块音频上传，并为每次上传创建一个新文件
 @app.route('/upload_audio', methods=['POST'])
 def upload_audio():
-    # 生成唯一的文件名
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    unique_filename = f"recording_{timestamp}_{uuid.uuid4().hex}.wav"
-    file_path = os.path.join(UPLOAD_DIR, unique_filename)
-
-    audio_data = request.data  # 接收来自 ESP32 的二进制音频数据
-
+    # 接收 ESP32 上傳的音頻並保存為 recording.wav
+    file_path = WAV_FILE
+    audio_data = request.data
     if not audio_data:
-        return "没有接收到音频数据", 400
+        return "没有接收到ESP32上傳的音檔資料", 400
 
-    # 将收到的音频数据保存为新文件
+    # 保存錄音數據
     with open(file_path, 'wb') as audio_file:
         audio_file.write(audio_data)
 
-    print(f"音频文件保存到: {file_path}, 大小: {len(audio_data)} 字节")
-
-    # return f"音频已保存到 {file_path}", 200
-    # 將音頻轉換為文字
+    # 將錄音轉為文字並查詢答案
     transcription = transcribe_audio(file_path)
-    return f"音频已保存到 {file_path}, 語音轉文字結果: {transcription}", 200
+    if transcription:
+        answer = query_openai(transcription)
+        if answer:
+            tts_file = text_to_speech_to_wav(answer)
+        else:
+            tts_file = os.path.join(UPLOAD_DIR, "noanswer.wav")  # 使用固定的音檔
+    else:
+        tts_file = os.path.join(UPLOAD_DIR, "noanswer.wav")  # 使用固定的音檔
 
-def transcribe_audio(file_path):
+    # 確保音檔存在，通知 ESP32 播放
+    if tts_file and os.path.exists(tts_file):
+        # 在发布消息前检查 MQTT 连接状态
+        if not mqtt_client.is_connected():
+            mqtt_client.reconnect()
+
+        result = mqtt_client.publish(mqtt_topic, "play")  # 通知 ESP32 播放音頻
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            print("MQTT 消息成功發佈")
+        else:
+            print("MQTT 消息發佈失敗，代碼:", result.rc)
+        return jsonify({"message": "音頻處理成功", "tts_file": tts_file})
+    else:
+        return "TTS 或播放音檔失敗", 500
+
+
+def transcribe_audio(audio_file):
     try:
-        # 使用 OpenAI 的 Whisper 模型進行語音轉文字
-        with open(file_path, 'rb') as audio_file:
+        with open(audio_file, 'rb') as audio_file:
             transcript = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file
             )
-        print(transcript.text)
-        #return transcript['text']
+        return transcript.text
     except Exception as e:
-        print(f"語音轉文字失敗: {e}")
-        return "語音轉文字失敗"
+        print(f"STT音檔轉換失敗: {e}")
+        return None
 
+def query_openai(question):
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",  # 或 "gpt-4" 視情況而定
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": question}
+            ],
+            max_tokens=300
+        )
+        print(response.choices[0].message.content)
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"OpenAI 查詢失敗: {e}")
+        return "無法回答此問題"
 
-# 处理文件上传完成后可以调用这个接口来补充一些逻辑（可选）
-@app.route('/complete_upload', methods=['POST'])
-def complete_upload():
-    # 你可以在这里处理文件上传完成后的逻辑
-    # 比如，如果想要处理一些额外操作，可以在这里补充
-    return "文件上传已完成", 200
+# def text_to_speech_to_wav(text):
+#     try:
+#         # 自动检测文本的语言
+#         detected_language = detect(text)
+#         print(f"检测到的语言: {detected_language}")
+        
+#         # 创建 TTS 对象，使用自动检测到的语言
+#         tts = gTTS(text, lang=detected_language)
+#         mp3_file = os.path.join(UPLOAD_DIR, "output.mp3")
+#         tts.save(mp3_file)
+
+#         ffmpeg_command = [
+#             "ffmpeg", "-y", "-i", mp3_file, "-ar", "20000", "-ac", "1", "-b:a", "128k", TTS_FILE
+#         ]
+#         subprocess.run(ffmpeg_command, check=True)
+
+#         return TTS_FILE
+#     except subprocess.CalledProcessError as e:
+#         print(f"FFmpeg 轉換失敗: {e}")
+#         return None
+#     except Exception as e:
+#         print(f"TTS 失敗: {e}")
+#         return None    
+def text_to_speech_to_wav(text):
+    try:
+        tts = gTTS(text, lang='zh-TW')
+        mp3_file = os.path.join(UPLOAD_DIR, "output.mp3")
+        tts.save(mp3_file)
+
+        ffmpeg_command = [
+            "ffmpeg", "-y", "-i", mp3_file, "-ar", "20000", "-ac", "1", "-b:a", "128k", TTS_FILE
+        ]
+        subprocess.run(ffmpeg_command, check=True)
+
+        return TTS_FILE
+    except subprocess.CalledProcessError as e:
+        print(f"FFmpeg 轉換失敗: {e}")
+        return None
+    except Exception as e:
+        print(f"TTS 失敗: {e}")
+        return None
+
+@app.route('/wav_audio', methods=['GET'])
+def stream_wav():
+    if os.path.exists(TTS_FILE):
+        return send_file(TTS_FILE, mimetype='audio/wav')
+    else:
+        return "WAV 文件不存在", 404
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    app.run(host='0.0.0.0', port=5001)
